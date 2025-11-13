@@ -21,7 +21,7 @@ import re_path
             name='file_manager_deep'), 
 
 
-├── /templates
+├── tasks/templates
 │   └── /tasks
 │       └── file_manager.html
 
