@@ -15,25 +15,24 @@ class FileItem:
 def file_manager_view(request, client_id, requested_path=''): 
     client = get_object_or_404(Client, client_id=client_id)
     
-    # URL에서 받은 경로 구분자 '::'를 실제 경로 구분자 '/'로 변환 (Windows 환경에 맞춰 '\'로 변경 가능)
+    # URL에서 받은 경로 구분자 '::'를 실제 경로 구분자 '/'로 변환
     current_path = requested_path.replace('::', '/')
 
     if not current_path:
-        # Default to a common root directory if no path is provided
         current_path = "C:\\" 
 
     # --- 1. 이전 Task 결과 확인 및 파싱 ---
-    # Check if a specific task ID was passed in the query (after a refresh/redirect)
     task_id_to_check = request.GET.get('task_id')
     last_task = None
     
+    # 먼저 요청된 task_id가 있는지 확인합니다.
     if task_id_to_check:
         try:
-            last_task = CommandTask.objects.get(id=task_id_to_check)
+            last_task = CommandTask.objects.get(id=task_id_to_check, client=client)
         except CommandTask.DoesNotExist:
             pass
     
-    # If no specific task ID, try to find the latest shell task for this client
+    # task_id가 없거나 해당 task가 없다면, 가장 최근의 EXECUTE_SHELL task를 찾습니다.
     if not last_task:
         last_task = CommandTask.objects.filter(
             client=client,
@@ -42,12 +41,15 @@ def file_manager_view(request, client_id, requested_path=''):
     
     file_list = []
 
-    if last_task and last_task.status == 'COMPLETED':
+    if last_task and last_task.status == 'COMPLETED' and last_task.result_content:
         try:
+            # 🚨 현재 파싱 로직은 'dir' 명령의 상세 출력(Header, Time, <DIR>, Size 포함)을 전제로 합니다.
+            # 🚨 클라이언트가 보낸 실제 결과 포맷에 맞춰 파싱 로직을 수정해야 합니다.
             lines = last_task.result_content.split('\n')
             
-            # Add '..' only if not at the root (simple heuristic for C:\)
-            if current_path.upper() not in ["C:\\", "D:\\"]:
+            # Add '..' if not at the root
+            is_root = (current_path.upper().rstrip('\\/') == "C:")
+            if not is_root and current_path != "/":
                 file_list.append(FileItem('..', is_dir=True))
 
             for line in lines:
@@ -55,33 +57,49 @@ def file_manager_view(request, client_id, requested_path=''):
                 if not line or line in ['.', '..']:
                     continue
                 
-                # Simple logic to guess if it's a directory (no extension/dot)
-                name_parts = line.split('.')
-                is_dir = len(name_parts) == 1 or line.endswith('/') or line.endswith('\\')
+                # 매우 단순화된 파싱 로직 (실제 상세 dir 출력에서는 동작하지 않을 수 있음)
+                name = os.path.basename(line.rstrip('\\/'))
+                is_dir = not os.path.splitext(name)[1] or line.endswith('\\') or line.endswith('/')
                 
                 file_list.append(FileItem(line, is_dir))
 
         except Exception as e:
-            print(f"Error parsing task result: {e}")
+            print(f"[ERROR] Error parsing task result for Task {last_task.id}: {e}")
             pass
 
-    # --- 2. 새 Task 생성 요청 (Always execute to get fresh data) ---
-    command_to_execute = f"cmd.exe /c \"dir \"{current_path}\" /a /b /o:n\""
+    # --- 2. 새 Task 생성 요청 (중복 방지 로직 적용) ---
+    path_for_command = current_path.rstrip('\\/') + os.sep
     
-    # Create a new CommandTask
-    new_task = CommandTask.objects.create(
-        client=client,
-        command_name='EXECUTE_SHELL',
-        payload=command_to_execute,
-        status='PENDING'
-    )
+    # 🌟🌟🌟 핵심 수정: 클라이언트가 기대하는 JSON 객체 형식으로 payload 구성 🌟🌟🌟
+    payload_dict = {
+        "command": "dir",
+        "arguments": [f"\"{path_for_command}\""], # 경로에 따옴표 포함
+        "timeout_seconds": 60
+    }
+    command_payload = json.dumps(payload_dict) # CommandTask.payload 필드에 저장할 문자열
+    
+    new_task = None
+    
+    # 중복 방지 로직: PENDING 상태이며 명령 내용이 정확히 일치하는 기존 Task 재사용
+    if last_task and last_task.status == 'PENDING' and last_task.payload == command_payload:
+        new_task = last_task
+        print(f"[INFO] Reusing pending Task ID {new_task.id} for path {current_path}.")
+    else:
+        # PENDING 상태가 아니거나 다른 명령이라면 새로운 Task를 생성합니다.
+        new_task = CommandTask.objects.create(
+            client=client,
+            command_name='EXECUTE_SHELL',
+            payload=command_payload, # JSON 문자열 저장
+            status='PENDING'
+        )
+        print(f"[INFO] Created new Task ID {new_task.id} for path {current_path}.")
     
     context = {
         'client': client,
         'current_path': current_path,
-        'display_path': current_path.replace('//', '/'), # Clean up path for display
+        'display_path': current_path.replace('//', '/'), 
         'file_list': file_list,
-        'new_task_id': new_task.id,
+        'new_task_id': new_task.id if new_task else None,
         'last_task': last_task,
         'title': f'클라이언트 파일 관리자: {client_id}',
         'app_label': 'tasks',
