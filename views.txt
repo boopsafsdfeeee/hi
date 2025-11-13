@@ -1,0 +1,91 @@
+from django.contrib.admin.views.decorators import staff_member_required
+
+
+
+
+# 파일 항목을 담을 구조체
+class FileItem:
+    def __init__(self, name, is_dir, size=None):
+        self.name = name
+        self.is_dir = is_dir
+        self.size = size
+
+# 파일 관리자 뷰 (핵심 기능)
+@staff_member_required
+def file_manager_view(request, client_id, requested_path=''): 
+    client = get_object_or_404(Client, client_id=client_id)
+    
+    # URL에서 받은 경로 구분자 '::'를 실제 경로 구분자 '/'로 변환 (Windows 환경에 맞춰 '\'로 변경 가능)
+    current_path = requested_path.replace('::', '/')
+
+    if not current_path:
+        # Default to a common root directory if no path is provided
+        current_path = "C:\\" 
+
+    # --- 1. 이전 Task 결과 확인 및 파싱 ---
+    # Check if a specific task ID was passed in the query (after a refresh/redirect)
+    task_id_to_check = request.GET.get('task_id')
+    last_task = None
+    
+    if task_id_to_check:
+        try:
+            last_task = CommandTask.objects.get(id=task_id_to_check)
+        except CommandTask.DoesNotExist:
+            pass
+    
+    # If no specific task ID, try to find the latest shell task for this client
+    if not last_task:
+        last_task = CommandTask.objects.filter(
+            client=client,
+            command_name='EXECUTE_SHELL'
+        ).order_by('-created_at').first()
+    
+    file_list = []
+
+    if last_task and last_task.status == 'COMPLETED':
+        try:
+            lines = last_task.result_content.split('\n')
+            
+            # Add '..' only if not at the root (simple heuristic for C:\)
+            if current_path.upper() not in ["C:\\", "D:\\"]:
+                file_list.append(FileItem('..', is_dir=True))
+
+            for line in lines:
+                line = line.strip()
+                if not line or line in ['.', '..']:
+                    continue
+                
+                # Simple logic to guess if it's a directory (no extension/dot)
+                name_parts = line.split('.')
+                is_dir = len(name_parts) == 1 or line.endswith('/') or line.endswith('\\')
+                
+                file_list.append(FileItem(line, is_dir))
+
+        except Exception as e:
+            print(f"Error parsing task result: {e}")
+            pass
+
+    # --- 2. 새 Task 생성 요청 (Always execute to get fresh data) ---
+    command_to_execute = f"cmd.exe /c \"dir \"{current_path}\" /a /b /o:n\""
+    
+    # Create a new CommandTask
+    new_task = CommandTask.objects.create(
+        client=client,
+        command_name='EXECUTE_SHELL',
+        payload=command_to_execute,
+        status='PENDING'
+    )
+    
+    context = {
+        'client': client,
+        'current_path': current_path,
+        'display_path': current_path.replace('//', '/'), # Clean up path for display
+        'file_list': file_list,
+        'new_task_id': new_task.id,
+        'last_task': last_task,
+        'title': f'클라이언트 파일 관리자: {client_id}',
+        'app_label': 'tasks',
+        'command_name': 'EXECUTE_SHELL'
+    }
+
+    return render(request, 'tasks/file_manager.html', context)
